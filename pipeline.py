@@ -152,16 +152,66 @@ PROMPT = (
     "{{\"<i>\": [\"span\"]}}; [] if none.")
 
 
-def adjudicate(montage, cands, answer_cache):
+ROW_HD = 120          # high-res row height for regional chunks
+CHUNK_LINES = 10      # lines per chunk image
+
+
+def build_chunks(img, cands, outdir="chunks"):
+    """Stage-2 input: split candidates into HIGH-RES regional chunk images
+    (~CHUNK_LINES lines each, ROW_HD tall) instead of one low-res montage, so
+    the adjudicator can actually read faint highlighter. Returns chunk paths."""
+    os.makedirs(outdir, exist_ok=True)
+    img = illum_normalize(img); om = orange_mask(img)
+    panels = []
+    for i, c in enumerate(cands):
+        x1, y1, x2, y2 = c["box"]; pad = 12
+        crop = img[max(0, y1 - pad):y2 + pad, max(0, x1 - 6):x2 + 6].copy()
+        m = om[max(0, y1 - pad):y2 + pad, max(0, x1 - 6):x2 + 6]
+        mc = cv2.morphologyEx(m, cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)))
+        for cnt in cv2.findContours(mc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+            if cv2.contourArea(cnt) > 80:
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                cv2.rectangle(crop, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
+        h, w = crop.shape[:2]
+        crop = cv2.resize(crop, (int(w * ROW_HD / h), ROW_HD), interpolation=cv2.INTER_CUBIC)
+        g = np.full((ROW_HD, 60, 3), 255, np.uint8)
+        cv2.putText(g, str(i), (3, ROW_HD // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 200), 2)
+        panels.append(np.hstack([g, crop]))
+    W = max(p.shape[1] for p in panels); paths = []
+    for ci in range(0, len(panels), CHUNK_LINES):
+        rows = []
+        for p in panels[ci:ci + CHUNK_LINES]:
+            if p.shape[1] < W:
+                p = np.hstack([p, np.full((p.shape[0], W - p.shape[1], 3), 255, np.uint8)])
+            rows += [p, np.full((6, W, 3), 180, np.uint8)]
+        path = f"{outdir}/chunk{ci // CHUNK_LINES}.png"
+        cv2.imwrite(path, np.vstack(rows)); paths.append(path)
+    return paths
+
+
+def density_guard(img, cands, lines):
+    """Warn when a page is too heavily marked / too low quality for reliable
+    auto-extraction (the triage can no longer prune)."""
+    om = orange_mask(illum_normalize(img))
+    page_orange = float(om.mean())
+    ratio = len(cands) / max(1, sum(1 for l in merge_rows(lines)
+                                    if sum(c.isascii() and c.isalpha() for c in l["text"]) >= 6))
+    warn = page_orange > 0.20 or ratio > 0.75
+    return {"page_orange": round(page_orange, 3), "cand_ratio": round(ratio, 2), "warn": warn}
+
+
+def adjudicate(chunks, cands, answer_cache):
+    """Send ALL high-res chunks in ONE multimodal request; return per-line spans."""
     if os.environ.get("ANTHROPIC_API_KEY"):
         import anthropic
         texts = "\n".join(f"[{i}] {c['text']}" for i, c in enumerate(cands))
-        b64 = base64.b64encode(open(montage, "rb").read()).decode()
+        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                    "data": base64.b64encode(open(p, "rb").read()).decode()}} for p in chunks]
+        content.append({"type": "text", "text": PROMPT.format(n=len(cands) - 1, texts=texts)})
         msg = anthropic.Anthropic().messages.create(
             model="claude-sonnet-4-6", max_tokens=1500,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-                {"type": "text", "text": PROMPT.format(n=len(cands) - 1, texts=texts)}]}])
+            messages=[{"role": "user", "content": content}])
         mm = re.search(r"\{.*\}", msg.content[0].text, re.S)
         return json.loads(mm.group(0)) if mm else {}
     return answer_cache
@@ -235,12 +285,17 @@ def main(image, answer_file=None):
     else:
         lines = run_ocr("doc_prod.png"); json.dump(lines, open(cache_ocr, "w"), ensure_ascii=False)
     cands = highlight_lines(doc, lines)
-    build_montage(doc, cands, "montage_prod.png")
+    guard = density_guard(doc, cands, lines)
+    if guard["warn"]:
+        print(f"⚠️  density guard: page_orange={guard['page_orange']}, "
+              f"cand_ratio={guard['cand_ratio']} — page may be over-marked or low "
+              f"quality; auto-extraction may be unreliable.")
+    chunks = build_chunks(doc, cands)
     ans = json.load(open(answer_file)) if (answer_file and os.path.exists(answer_file)) else {}
-    ans = adjudicate("montage_prod.png", cands, ans)
+    ans = adjudicate(chunks, cands, ans)
     result = assemble(cands, ans)
     json.dump(result, open("result_prod.json", "w"), ensure_ascii=False, indent=1)
-    print(f"{len(cands)} candidate lines -> 1 call -> {len(result)} items")
+    print(f"{len(cands)} candidate lines -> {len(chunks)} HD chunks, 1 call -> {len(result)} items")
     for i, t in enumerate(result, 1):
         print(f"{i:2d}. {t}")
     return cands, result
