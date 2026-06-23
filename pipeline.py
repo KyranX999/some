@@ -87,6 +87,44 @@ def merge_rows(lines):
     return out
 
 
+def white_balance(img):
+    """Neutralise colour cast: scale channels so the paper (bright pixels) is grey.
+    Robust to coloured ink because it anchors on the bright background, not the mean."""
+    out = img.astype(np.float32)
+    ref = []
+    for ch in range(3):
+        v = img[:, :, ch]
+        ref.append(np.percentile(v[v > 60], 92) if (v > 60).any() else 255.0)
+    g = max(ref)
+    for ch in range(3):
+        out[:, :, ch] *= g / max(1.0, ref[ch])
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def deskew(img):
+    """Estimate small page skew from dark-text pixels and rotate level."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    th = cv2.medianBlur(th, 3)
+    coords = np.column_stack(np.where(th > 0))
+    if len(coords) < 500:
+        return img
+    ang = cv2.minAreaRect(coords[:, ::-1])[-1]
+    ang = ang - 90 if ang > 45 else ang
+    if abs(ang) < 0.3 or abs(ang) > 15:      # ignore noise / implausible
+        return img
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), ang, 1.0)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+def preprocess(img):
+    """Post-capture cleanup BEFORE OCR + HSV: white-balance then deskew.
+    (illumination/cast for the colour mask is further handled in illum_normalize.)"""
+    return deskew(white_balance(img))
+
+
 def illum_normalize(img):
     """Remove warm lighting / paper colour cast so genuine highlighter (a solid
     translucent fill) is separable from background tint. Divide by a blurred
@@ -278,7 +316,7 @@ def assemble(cands, ans):
 
 
 def main(image, answer_file=None):
-    doc = load_doc(image); cv2.imwrite("doc_prod.png", doc)
+    doc = preprocess(load_doc(image)); cv2.imwrite("doc_prod.png", doc)
     cache_ocr = image + ".ocr.json"
     if os.path.exists(cache_ocr):
         lines = json.load(open(cache_ocr))
