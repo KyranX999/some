@@ -87,6 +87,14 @@ def merge_rows(lines):
     return out
 
 
+def illum_normalize(img):
+    """Remove warm lighting / paper colour cast so genuine highlighter (a solid
+    translucent fill) is separable from background tint. Divide by a blurred
+    background estimate."""
+    bg = cv2.GaussianBlur(img, (0, 0), 35)
+    return np.clip(cv2.divide(img, bg, scale=200), 0, 255).astype(np.uint8)
+
+
 def orange_mask(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
@@ -95,13 +103,13 @@ def orange_mask(img):
 
 def highlight_lines(img, lines):
     lines = merge_rows(lines)
-    om = orange_mask(img); out = []
+    om = orange_mask(illum_normalize(img)); out = []
     for l in lines:
         if sum(c.isascii() and c.isalpha() for c in l["text"]) < 6:
             continue
         xs = [p[0] for p in l["line_box"]]; ys = [p[1] for p in l["line_box"]]
         x1, x2, y1, y2 = int(min(xs)), int(max(xs)), int(min(ys)), int(max(ys))
-        if (x2 - x1) < 120 or om[y1:y2 + 6, x1:x2].mean() <= 0.05:
+        if (x2 - x1) < 120 or om[y1:y2 + 6, x1:x2].mean() <= 0.03:
             continue
         out.append({**l, "box": [x1, y1, x2, y2], "ytop": y1, "xleft": x1, "xright": x2})
     out.sort(key=lambda r: r["ytop"])
@@ -110,6 +118,7 @@ def highlight_lines(img, lines):
 
 # ---------- Stage 2 ----------
 def build_montage(img, cands, path):
+    img = illum_normalize(img)          # clearer crops, cast removed
     om = orange_mask(img); panels = []
     for i, c in enumerate(cands):
         x1, y1, x2, y2 = c["box"]; pad = 10
