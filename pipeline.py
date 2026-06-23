@@ -87,6 +87,52 @@ def merge_rows(lines):
     return out
 
 
+def _doc_quad(img):
+    """Largest 4-corner contour = the paper, for perspective rectification."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    e = cv2.Canny(cv2.GaussianBlur(g, (5, 5), 0), 60, 180)
+    e = cv2.dilate(e, np.ones((3, 3), np.uint8))
+    cnts, _ = cv2.findContours(e, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H, W = img.shape[:2]
+    for c in sorted(cnts, key=cv2.contourArea, reverse=True)[:5]:
+        if cv2.contourArea(c) < 0.35 * H * W:
+            break
+        ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+        if len(ap) == 4:
+            return ap.reshape(4, 2).astype(np.float32)
+    return None
+
+
+def perspective_correct(img):
+    q = _doc_quad(img)
+    if q is None:
+        return img
+    s = q.sum(1); d = np.diff(q, axis=1).ravel()
+    tl, br, tr, bl = q[np.argmin(s)], q[np.argmax(s)], q[np.argmin(d)], q[np.argmax(d)]
+    wA = np.linalg.norm(br - bl); wB = np.linalg.norm(tr - tl)
+    hA = np.linalg.norm(tr - br); hB = np.linalg.norm(tl - bl)
+    Wd, Hd = int(max(wA, wB)), int(max(hA, hB))
+    if Wd < 200 or Hd < 200:
+        return img
+    M = cv2.getPerspectiveTransform(np.array([tl, tr, br, bl], np.float32),
+                                    np.array([[0, 0], [Wd, 0], [Wd, Hd], [0, Hd]], np.float32))
+    return cv2.warpPerspective(img, M, (Wd, Hd))
+
+
+def remove_shadow(img):
+    """Colour-preserving shadow / uneven-illumination removal (the scanner-grade
+    step): estimate per-channel background by a large morphological close and
+    divide it out. Unlike binarisation it KEEPS colour, so the highlighter
+    survives for the HSV stage."""
+    out = []
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    for ch in cv2.split(img):
+        bg = cv2.morphologyEx(ch, cv2.MORPH_CLOSE, k)
+        bg = cv2.medianBlur(bg, 21)
+        out.append(cv2.divide(ch, bg, scale=255))
+    return cv2.merge(out)
+
+
 def white_balance(img):
     """Neutralise colour cast: scale channels so the paper (bright pixels) is grey.
     Robust to coloured ink because it anchors on the bright background, not the mean."""
@@ -119,10 +165,27 @@ def deskew(img):
                           borderMode=cv2.BORDER_REPLICATE)
 
 
-def preprocess(img):
-    """Post-capture cleanup BEFORE OCR + HSV: white-balance then deskew.
-    (illumination/cast for the colour mask is further handled in illum_normalize.)"""
-    return deskew(white_balance(img))
+def preprocess(img, heavy=False):
+    """Post-capture cleanup before OCR + HSV — COLOUR-PRESERVING by design.
+
+    Borrows the mobile-document-scanner pipeline but deliberately stops BEFORE
+    binarisation: B&W would erase the orange highlighter our colour stage needs.
+
+    Default = LIGHT touch (white-balance + deskew). Measured: the heavy classic
+    steps (morphological shadow removal, bilateral denoise, auto-perspective)
+    HURT modern colour OCR on tricky pages (PP-OCRv6 already handles lighting),
+    so they are opt-in via `heavy=True`, and perspective only fires on a
+    confident full-page quad.
+
+    iOS note: capture with VisionKit VNDocumentCameraViewController — it does
+    perspective rectification + enhancement at OS level for free; request the
+    COLOUR/photo output (not the B&W 'document' filter) to keep the highlighter,
+    then this light touch-up suffices.
+    """
+    if heavy:
+        img = perspective_correct(img)
+        img = remove_shadow(white_balance(img))
+    return deskew(img)        # conditional: no-op unless meaningfully skewed
 
 
 def illum_normalize(img):
